@@ -23,6 +23,8 @@ from control import (
     SimulatedPlant,
     SoftwarePID,
     TrajectoryGenerator,
+    feedforward_command,
+    feedforward_trim,
     fit_fopdt_step,
     imc_tune,
     simulate,
@@ -460,6 +462,45 @@ def test_settings_write_is_atomic(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "replace", real_replace)
 
     assert app_settings.load("t.json") == {"keep": 1}
+
+
+def test_feedforward_sine_inverts_first_order_plant():
+    model = PlantModel(K_nm_per_V=410.0, tau_s=0.08)
+    # ωτ = 1 → boost √2, lead 45 deg. Peak nm 410 → static peak 1 V, Vpp 2 V.
+    freq = 1.0 / (2.0 * math.pi * model.tau_s)
+    cmd = feedforward_command("Sine", 410.0, 820.0, freq, model, phase_deg=10.0)
+    assert cmd.boost == pytest.approx(math.sqrt(2.0), rel=1e-6)
+    assert cmd.amplitude_vpp == pytest.approx(2.0 * math.sqrt(2.0), rel=1e-6)
+    assert cmd.offset_v == pytest.approx(2.0, rel=1e-6)
+    assert cmd.phase_deg == pytest.approx(55.0, abs=1e-6)
+
+
+def test_feedforward_square_is_static_scale():
+    model = PlantModel(K_nm_per_V=100.0, tau_s=0.08)
+    cmd = feedforward_command("Square", 50.0, 100.0, 10.0, model)
+    assert cmd.amplitude_vpp == pytest.approx(1.0)
+    assert cmd.offset_v == pytest.approx(1.0)
+    assert cmd.boost == 1.0
+
+
+def test_feedforward_trim_updates_shift_and_scale_once():
+    samples = [180.0, 20.0, 180.0, 20.0, 180.0, 20.0, 180.0, 20.0]
+    offset, amp, changed = feedforward_trim(
+        "Sine", 0.0, 100.0, samples, offset_tol_nm=25.0, amplitude_tol_frac=0.15
+    )
+    assert changed
+    assert offset == pytest.approx(-100.0)
+    assert amp == pytest.approx(100.0 * 100.0 / 80.0)
+
+
+def test_feedforward_trim_holds_inside_tolerance():
+    samples = [90.0, -90.0] * 8
+    offset, amp, changed = feedforward_trim(
+        "Sine", 0.0, 100.0, samples, offset_tol_nm=25.0, amplitude_tol_frac=0.15
+    )
+    assert not changed
+    assert offset == 0.0
+    assert amp == 100.0
 
 
 if __name__ == "__main__":

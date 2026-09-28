@@ -153,6 +153,139 @@ class TrajectoryGenerator:
         return self.frequency_hz > bw_hz
 
 
+@dataclass
+class FeedforwardCommand:
+    """One Moku waveform configuration computed from a desired displacement.
+
+    The computer sends this once. The Moku plays it. Sample-by-sample
+    correction stays in the UMD2; this object is not a feedback law.
+    """
+
+    amplitude_vpp: float
+    offset_v: float
+    phase_deg: float
+    boost: float
+
+
+def feedforward_command(
+    waveform: str,
+    amplitude_nm: float,
+    offset_nm: float,
+    frequency_hz: float,
+    model: PlantModel,
+    phase_deg: float = 0.0,
+    duty_pct: float = 50.0,
+) -> FeedforwardCommand:
+    """Convert a desired displacement shape into one Moku voltage waveform.
+
+    Sine, square, and ramp are symmetric about the offset, so the Moku
+    peak-to-peak voltage is ``2 * amplitude_nm / K``. A sine is also
+    pre-emphasized by the first-order plant inverse: amplitude grows by
+    ``sqrt(1+(ωτ)²)`` and the phase leads by ``atan(ωτ)``. Square, ramp,
+    pulse, and noise stay a static scale, because those shapes cannot carry
+    that inverse and still be the waveform the Moku generator knows.
+
+    Pulse rests at ``offset_nm`` and rises by ``amplitude_nm``. The Moku
+    pulse is symmetric about its offset, so the voltage offset is shifted
+    up by half the pulse height.
+    """
+    if model.K_nm_per_V <= 0.0:
+        raise ValueError("K must be > 0 nm/V")
+    if amplitude_nm < 0.0:
+        raise ValueError("amplitude_nm must be >= 0")
+
+    scale = 1.0 / model.K_nm_per_V
+    boost = 1.0
+    phase = float(phase_deg) % 360.0
+    offset_v = float(offset_nm) * scale
+
+    if waveform == "Sine" and frequency_hz > 0.0 and model.tau_s > 0.0:
+        w_tau = 2.0 * math.pi * float(frequency_hz) * model.tau_s
+        boost = math.sqrt(1.0 + w_tau * w_tau)
+        phase = (phase + math.degrees(math.atan(w_tau))) % 360.0
+
+    if waveform == "Pulse":
+        height_v = float(amplitude_nm) * scale
+        return FeedforwardCommand(
+            amplitude_vpp=height_v,
+            offset_v=offset_v + 0.5 * height_v,
+            phase_deg=phase,
+            boost=boost,
+        )
+
+    if waveform == "Noise":
+        return FeedforwardCommand(
+            amplitude_vpp=float(amplitude_nm) * scale,
+            offset_v=0.0,
+            phase_deg=0.0,
+            boost=1.0,
+        )
+
+    return FeedforwardCommand(
+        amplitude_vpp=2.0 * float(amplitude_nm) * scale * boost,
+        offset_v=offset_v,
+        phase_deg=phase,
+        boost=boost,
+    )
+
+
+def expected_mean_nm(
+    waveform: str,
+    offset_nm: float,
+    amplitude_nm: float,
+    duty_pct: float = 50.0,
+) -> float:
+    """Displacement mean a symmetric wave, or a pulse, should sit at."""
+    duty = min(max(float(duty_pct) / 100.0, 0.0), 1.0)
+    if waveform == "Pulse":
+        return float(offset_nm) + float(amplitude_nm) * duty
+    if waveform == "Square":
+        return float(offset_nm) + float(amplitude_nm) * (2.0 * duty - 1.0)
+    return float(offset_nm)
+
+
+def feedforward_trim(
+    waveform: str,
+    offset_nm: float,
+    amplitude_nm: float,
+    samples_nm: list[float],
+    offset_tol_nm: float,
+    amplitude_tol_frac: float,
+    duty_pct: float = 50.0,
+) -> tuple[float, float, bool]:
+    """Nudge the feedforward command when the measured trace is shifted or scaled.
+
+    Returns ``(offset_nm, amplitude_nm, changed)``. One call is one update of
+    the command that will be sent again; it is not a per-sample controller.
+    Noise has no stable amplitude, so only its offset is considered, and a
+    pulse's mean is compared with ``offset + amplitude * duty``.
+    """
+    if len(samples_nm) < 8:
+        return float(offset_nm), float(amplitude_nm), False
+
+    measured_mean = float(sum(samples_nm) / len(samples_nm))
+    target_mean = expected_mean_nm(waveform, offset_nm, amplitude_nm, duty_pct)
+    new_offset = float(offset_nm)
+    new_amp = float(amplitude_nm)
+    changed = False
+
+    if abs(measured_mean - target_mean) > float(offset_tol_nm):
+        new_offset = float(offset_nm) + (target_mean - measured_mean)
+        changed = True
+
+    if waveform not in ("Noise", "Pulse") and amplitude_nm > 0.0:
+        measured_amp = 0.5 * (max(samples_nm) - min(samples_nm))
+        if measured_amp > 1.0:
+            ratio = measured_amp / float(amplitude_nm)
+            if abs(ratio - 1.0) > float(amplitude_tol_frac):
+                new_amp = float(amplitude_nm) / ratio
+                changed = True
+
+    if new_amp < 0.0:
+        new_amp = 0.0
+    return new_offset, new_amp, changed
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Controllers
 # ─────────────────────────────────────────────────────────────────────────────

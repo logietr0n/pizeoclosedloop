@@ -30,6 +30,8 @@ import webbrowser
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
 
+from control import DEFAULT_K_NM_PER_V, DEFAULT_TAU_S, PlantModel, feedforward_command, feedforward_trim
+
 
 # ── Optional Moku imports ─────────────────────────────────────────────
 try:
@@ -75,6 +77,12 @@ SYMMETRY_MAX = 100.0
 PULSE_EDGE_TIME_MIN = 16e-9  # Moku:Go
 DEFAULT_PULSE_WIDTH = 1e-4   # 100 us
 DEFAULT_EDGE_TIME = 16e-9
+
+# Slow feedforward trim. One check every few seconds, then at most one new
+# waveform. This is not the sample-by-sample loop.
+FF_TRIM_PERIOD_MS = 2000
+FF_OFFSET_TOL_NM = 25.0
+FF_AMP_TOL_FRAC = 0.15
 
 
 class MokuWaveformFrame(ttk.Frame):
@@ -128,6 +136,18 @@ class MokuWaveformFrame(ttk.Frame):
         self.diff_corner_var = tk.DoubleVar(value=100.0)
         self.output_limit_var = tk.DoubleVar(value=5.0)
         self.pid_status_var = tk.StringVar(value="PID off")
+
+        # Desired displacement for the one-shot feedforward command.
+        self.ff_amp_nm_var = tk.DoubleVar(value=200.0)
+        self.ff_offset_nm_var = tk.DoubleVar(value=0.0)
+        self.ff_k_var = tk.DoubleVar(value=DEFAULT_K_NM_PER_V)
+        self.ff_tau_var = tk.DoubleVar(value=DEFAULT_TAU_S)
+        self.ff_trim_var = tk.BooleanVar(value=False)
+        self.ff_status_var = tk.StringVar(
+            value="Feedforward idle. Apply once; the Moku keeps playing that wave."
+        )
+        self.display_tab = None
+        self._ff_after_id = None
 
         # Widget refs used for show/hide/enable logic
         self._frequency_widgets = []
@@ -483,9 +503,48 @@ class MokuWaveformFrame(ttk.Frame):
             row=0, column=1, sticky="w", padx=(5, 0)
         )
 
+        # ── Feedforward: one waveform to the Moku ─────────────────────
+        ff_frame = ttk.LabelFrame(self, text="Feedforward drive (computer + Moku)", padding=8)
+        ff_frame.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(10, 5))
+        for c in range(4):
+            ff_frame.columnconfigure(c, weight=1)
+
+        ttk.Label(
+            ff_frame,
+            text=(
+                "Sets the piezo voltage for the wave type above and sends it once.\n"
+                "The UMD2 keeps its own correction. This does not rewrite the output every sample."
+            ),
+            justify="left",
+        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
+
+        ttk.Label(ff_frame, text="Amplitude (nm):").grid(row=1, column=0, sticky="e", pady=2)
+        ttk.Entry(ff_frame, textvariable=self.ff_amp_nm_var, width=10).grid(row=1, column=1, sticky="w", pady=2)
+        ttk.Label(ff_frame, text="Offset (nm):").grid(row=1, column=2, sticky="e", pady=2)
+        ttk.Entry(ff_frame, textvariable=self.ff_offset_nm_var, width=10).grid(row=1, column=3, sticky="w", pady=2)
+
+        ttk.Label(ff_frame, text="Sensitivity (nm/V):").grid(row=2, column=0, sticky="e", pady=2)
+        ttk.Entry(ff_frame, textvariable=self.ff_k_var, width=10).grid(row=2, column=1, sticky="w", pady=2)
+        ttk.Label(ff_frame, text="Plant time (s):").grid(row=2, column=2, sticky="e", pady=2)
+        ttk.Entry(ff_frame, textvariable=self.ff_tau_var, width=10).grid(row=2, column=3, sticky="w", pady=2)
+
+        tb.Button(
+            ff_frame, text="Apply feedforward", bootstyle=PRIMARY, command=self._apply_feedforward
+        ).grid(row=3, column=0, sticky="w", pady=(6, 2))
+        tb.Checkbutton(
+            ff_frame,
+            text="If the uMD trace is shifted or scaled, send an updated command",
+            variable=self.ff_trim_var,
+            command=self._on_ff_trim_toggled,
+            bootstyle="round-toggle",
+        ).grid(row=3, column=1, columnspan=3, sticky="w", pady=(6, 2))
+        ttk.Label(ff_frame, textvariable=self.ff_status_var, justify="left").grid(
+            row=4, column=0, columnspan=4, sticky="w", pady=(4, 0)
+        )
+
         # ── PID Smoothing section ─────────────────────────────────────
         pid_frame = ttk.LabelFrame(self, text="PID Smoothing (Closed-Loop)", padding=8)
-        pid_frame.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(10, 5))
+        pid_frame.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(10, 5))
         pid_frame.columnconfigure(1, weight=1)
 
         self._pid_check = tb.Checkbutton(
@@ -602,6 +661,7 @@ class MokuWaveformFrame(ttk.Frame):
             messagebox.showerror("Connection failed", str(e))
 
     def _disconnect(self, silent: bool = False):
+        self._stop_ff_trim()
         self._pid_active = False
         if self._software_control:
             self._software_control = False
@@ -659,6 +719,7 @@ class MokuWaveformFrame(ttk.Frame):
         if self._wg is None:
             raise RuntimeError("Moku not connected")
 
+        self._stop_ff_trim()
         if self._pid_active:
             self._disable_pid()
         self._set_routing_wg_direct()
@@ -777,6 +838,152 @@ class MokuWaveformFrame(ttk.Frame):
             kwargs["diff_corner"] = float(self.diff_corner_var.get())
 
         self._pid.set_by_gain(**kwargs)
+
+    # ==================================================================
+    # Feedforward: one computed waveform, then the Moku plays it
+    # ==================================================================
+    def attach_display(self, display_tab):
+        """uMD measurement source used only to decide when to resend a command."""
+        self.display_tab = display_tab
+
+    def _feedforward_model(self) -> PlantModel:
+        return PlantModel(
+            K_nm_per_V=float(self.ff_k_var.get()),
+            tau_s=float(self.ff_tau_var.get()),
+        )
+
+    def _apply_feedforward(self):
+        if self._wg is None:
+            messagebox.showwarning("Not connected", "Connect to your Moku:Go first.")
+            return
+        if self._software_control:
+            messagebox.showwarning(
+                "Closed-loop control active",
+                "Stop the software closed-loop controller before applying feedforward.",
+            )
+            return
+
+        try:
+            wave_type = self.wave_type_var.get().strip()
+            duty = float(self.duty_var.get()) if wave_type == "Square" else 50.0
+            cmd = feedforward_command(
+                waveform=wave_type,
+                amplitude_nm=float(self.ff_amp_nm_var.get()),
+                offset_nm=float(self.ff_offset_nm_var.get()),
+                frequency_hz=float(self.frequency_var.get()) if wave_type != "Noise" else 0.0,
+                model=self._feedforward_model(),
+                phase_deg=float(self.phase_var.get()) if wave_type != "Noise" else 0.0,
+                duty_pct=duty,
+            )
+            config = self.get_current_waveform_config()
+            config["amplitude"] = cmd.amplitude_vpp
+            if wave_type != "Noise":
+                config["offset"] = cmd.offset_v
+                config["phase"] = cmd.phase_deg
+            self._apply_waveform_config(config)
+            self.amplitude_var.set(cmd.amplitude_vpp)
+            if wave_type != "Noise":
+                self.offset_var.set(cmd.offset_v)
+            lead = ""
+            if wave_type == "Sine" and cmd.boost != 1.0:
+                lead = f", sine boost {cmd.boost:.3f}"
+            self.ff_status_var.set(
+                f"Sent once: {cmd.amplitude_vpp:.4f} Vpp, offset {cmd.offset_v:.4f} V, "
+                f"phase {cmd.phase_deg:.1f} deg{lead}."
+            )
+        except (MokuException, ValueError, RuntimeError) as e:
+            self.ff_status_var.set(f"Feedforward not sent: {e}")
+            messagebox.showerror("Feedforward", str(e))
+
+    def _on_ff_trim_toggled(self):
+        if self.ff_trim_var.get():
+            self._schedule_ff_trim()
+            self.ff_status_var.set(
+                "Watching the uMD trace. A shifted or scaled wave sends one new command."
+            )
+        else:
+            self._stop_ff_trim()
+            self.ff_status_var.set("Feedforward trim off. The last waveform keeps playing.")
+
+    def _stop_ff_trim(self):
+        self.ff_trim_var.set(False)
+        if self._ff_after_id is not None:
+            try:
+                self.after_cancel(self._ff_after_id)
+            except Exception:
+                pass
+            self._ff_after_id = None
+
+    def _schedule_ff_trim(self):
+        if self._ff_after_id is not None:
+            try:
+                self.after_cancel(self._ff_after_id)
+            except Exception:
+                pass
+        self._ff_after_id = self.after(FF_TRIM_PERIOD_MS, self._ff_trim_tick)
+
+    def _recent_nm_samples(self) -> list[float]:
+        display = self.display_tab
+        if display is None or not getattr(display, "data_buffer", None):
+            return []
+        try:
+            freq = float(self.frequency_var.get())
+        except Exception:
+            freq = 0.0
+        window_s = 2.0 if freq <= 0.0 else max(2.0, 2.0 / freq)
+        now = None
+        samples = []
+        for ts, nm in list(display.data_buffer):
+            if now is None or ts > now:
+                now = ts
+            samples.append((ts, nm))
+        if now is None:
+            return []
+        return [nm for ts, nm in samples if now - ts <= window_s]
+
+    def _ff_trim_tick(self):
+        self._ff_after_id = None
+        if not self.ff_trim_var.get():
+            return
+        try:
+            wave_type = self.wave_type_var.get().strip()
+            duty = float(self.duty_var.get()) if wave_type == "Square" else (
+                50.0 if wave_type != "Pulse" else self._pulse_duty_pct()
+            )
+            samples = self._recent_nm_samples()
+            new_offset, new_amp, changed = feedforward_trim(
+                waveform=wave_type,
+                offset_nm=float(self.ff_offset_nm_var.get()),
+                amplitude_nm=float(self.ff_amp_nm_var.get()),
+                samples_nm=samples,
+                offset_tol_nm=FF_OFFSET_TOL_NM,
+                amplitude_tol_frac=FF_AMP_TOL_FRAC,
+                duty_pct=duty,
+            )
+            if changed and self._wg is not None and not self._software_control:
+                self.ff_offset_nm_var.set(new_offset)
+                self.ff_amp_nm_var.set(new_amp)
+                self._apply_feedforward()
+                self.ff_status_var.set(
+                    self.ff_status_var.get()
+                    + f" Updated command to {new_amp:.1f} nm at {new_offset:.1f} nm."
+                )
+            elif not samples:
+                self.ff_status_var.set("Waiting for a uMD displacement stream before updating the command.")
+        except Exception as e:
+            self.ff_status_var.set(f"Feedforward trim skipped: {e}")
+        if self.ff_trim_var.get():
+            self._schedule_ff_trim()
+
+    def _pulse_duty_pct(self) -> float:
+        try:
+            freq = float(self.frequency_var.get())
+            width = float(self.pulse_width_var.get())
+            if freq <= 0.0:
+                return 50.0
+            return max(0.0, min(100.0, 100.0 * width * freq))
+        except Exception:
+            return 50.0
 
     # ==================================================================
     # Waveform application
